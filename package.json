@@ -1,0 +1,26 @@
+{
+  "name": "orderkuota-gateway",
+  "version": "1.0.0",
+  "description": "API Gateway mandiri (Autonomous & Stateful) untuk verifikasi mutasi transaksi OrderKuota & QRIS Dinamis",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "author": "NUXYS PROJECT",
+  "license": "MIT",
+  "dependencies": {
+    "autoft-qris": "^1.0.8",
+    "axios": "^1.6.8",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "qrcode": "^1.5.3",
+    "qs": "^6.12.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
