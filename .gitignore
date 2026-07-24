@@ -1,5 +1,8 @@
 node_modules/
 .env
 .orderkuota_cache.json
+.SESI_ORKUT_JANGAN_HAPUS.json
+*.db
+backup_raw/
 .DS_Store
 npm-debug.log*

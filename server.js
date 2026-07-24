@@ -1,435 +1,613 @@
 require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const QRCode = require('qrcode');
-const qs = require('qs');
-const fs = require('fs');
-const path = require('path');
-const { crypto } = require('crypto');
+const crypto = require('crypto');
+
+const OrderKuotaCore = require('./core');
+const db = require('./database');
+const SessionManager = require('./sessionManager');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const API_KEY_SISTEM = process.env.API_KEY || 'supersecretkey123';
-const CACHE_FILE_PATH = path.join(__dirname, '.orderkuota_cache.json');
+const SYSTEM_API_KEY = process.env.API_KEY || 'supersecretkey123';
 
-// OrderKuota API Constants
-const API_URL = 'https://app.orderkuota.com:443/api/v2';
-const HOST = 'app.orderkuota.com';
-const USER_AGENT = 'okhttp/4.12.0';
-const APP_VERSION_NAME = '25.12.31';
-const APP_VERSION_CODE = '2173257';
-const APP_REG_ID = 'fmn9oYXrRN6_kjpTGNlT-a%3AAPA91bGM5WvbAvKlFLCx9p3eVPOP_8awY6oP2ChgSch1vY4m3Mi6wnJLmlXbOYytIC2Wat7eum5tilchooYEoOr4wLKKdOgrCz_cq79A5hIpWaWH1fYyznQ&';
-
-// In-Memory Storage & Maps
-const qrCodeStorageMap = new Map();
-const daftarTransaksiYangSudahDiklaimMap = new Map();
-const logAktivitasSistem = [];
-
-// Cleanup stale transactions older than 24 hours
-setInterval(() => {
-    const waktuBatasSatuHari = Date.now() - (24 * 60 * 60 * 1000);
-    for (const [idTransaksi, timestamp] of daftarTransaksiYangSudahDiklaimMap.entries()) {
-        if (timestamp < waktuBatasSatuHari) {
-            daftarTransaksiYangSudahDiklaimMap.delete(idTransaksi);
-        }
+process.on('uncaughtException', (err) => {
+    const message = err?.message || String(err);
+    if (message.includes('ETIMEDOUT') || message.includes('ECONNRESET') || message.includes('EFATAL')) {
+        console.warn('⚠️ [SERVER] Error Koneksi Jaringan (Auto-recovered):', message);
+    } else {
+        console.error('⚠️ [SERVER] Uncaught Exception:', err);
     }
-}, 60 * 60 * 1000);
+});
 
-function catatLogAktivitas(tipe, pesan, detail = null) {
-    const itemLog = {
-        timestamp: new Date().toISOString(),
-        type: tipe,
-        message: pesan,
-        detail: detail
-    };
-    logAktivitasSistem.unshift(itemLog);
-    if (logAktivitasSistem.length > 100) logAktivitasSistem.pop();
-    
-    const awalan = `[${itemLog.timestamp}] [${tipe}]`;
-    if (tipe === 'ERROR') console.error(`${awalan} ${pesan}`, detail || '');
-    else if (tipe === 'WARNING') console.warn(`${awalan} ${pesan}`);
-    else console.log(`${awalan} ${pesan}`);
-}
-
-// Stateful Cache File Functions (.orderkuota_cache.json)
-function saveCacheToFile(dataObj) {
-    try {
-        const cacheData = {
-            username: dataObj.username || process.env.ORKUT_USERNAME,
-            token: dataObj.token || process.env.ORKUT_TOKEN,
-            user_id: dataObj.user_id || process.env.ORKUT_USER_ID,
-            last_updated: new Date().toISOString()
-        };
-        fs.writeFileSync(CACHE_FILE_PATH, JSON.stringify(cacheData, null, 2), 'utf8');
-        catatLogAktivitas('INFO', 'Cache sesi OrderKuota berhasil disimpan ke file .orderkuota_cache.json');
-    } catch (err) {
-        catatLogAktivitas('ERROR', `Gagal menyimpan file cache: ${err.message}`);
+process.on('unhandledRejection', (reason) => {
+    const message = reason?.message || String(reason);
+    if (message.includes('ETIMEDOUT') || message.includes('ECONNRESET') || message.includes('EFATAL')) {
+        console.warn('⚠️ [SERVER] Rejection Jaringan (Auto-recovered):', message);
+    } else {
+        console.error('⚠️ [SERVER] Unhandled Rejection:', reason);
     }
-}
+});
 
-function loadCacheFromFile() {
-    try {
-        if (fs.existsSync(CACHE_FILE_PATH)) {
-            const raw = fs.readFileSync(CACHE_FILE_PATH, 'utf8');
-            const parsed = JSON.parse(raw);
-            if (parsed && (parsed.token || parsed.user_id)) {
-                return parsed;
-            }
-        }
-    } catch (err) {
-        catatLogAktivitas('ERROR', `Gagal membaca file .orderkuota_cache.json: ${err.message}`);
-    }
-    return null;
-}
-
-// Express Security Middlewares
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const limiterPermintaan = rateLimit({
-    windowMs: 1 * 60 * 1000,
+const apiRateLimiter = rateLimit({
+    windowMs: 60 * 1000,
     max: 120,
     message: { success: false, error: 'Terlalu banyak permintaan. Silakan coba lagi nanti.' }
 });
-app.use(limiterPermintaan);
+app.use(apiRateLimiter);
 
-function autentikasiApiKey(permintaan, respon, lanjut) {
-    const apiKeyDikirim = permintaan.headers['x-api-key'] || permintaan.query.api_key;
-    if (!apiKeyDikirim || apiKeyDikirim !== API_KEY_SISTEM) {
-        catatLogAktivitas('WARNING', `Akses Ditolak: API Key tidak valid dari IP ${permintaan.ip}`);
-        return respon.status(401).json({ success: false, error: 'Akses Ditolak: API Key Tidak Valid' });
-    }
-    lanjut();
-}
-
-// EMVCo Dynamic QRIS Generator (CRC16-CCITT)
-function crc16ccitt(str) {
-    let crc = 0xffff;
-    for (let i = 0; i < str.length; i++) {
-        crc ^= str.charCodeAt(i) << 8;
-        for (let j = 0; j < 8; j++) {
-            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
-            crc &= 0xffff;
-        }
-    }
-    return crc.toString(16).toUpperCase().padStart(4, '0');
-}
-
-function parseEmvTags(qris) {
-    const tags = [];
-    let i = 0;
-    while (i + 4 <= qris.length) {
-        const id = qris.slice(i, i + 2);
-        const len = Number(qris.slice(i + 2, i + 4));
-        const value = qris.slice(i + 4, i + 4 + len);
-        if (!id || !Number.isFinite(len) || value.length !== len) break;
-        tags.push({ id, len, value });
-        i += 4 + len;
-    }
-    return tags;
-}
-
-function buildEmvTags(tags) {
-    return tags.map((t) => t.id + String(t.value.length).padStart(2, '0') + t.value).join('');
-}
-
-function generateDynamicQRIS(qrisStatis, nominal) {
-    let raw = String(qrisStatis || '').trim();
-    raw = raw.replace(/6304[0-9A-Fa-f]{4}$/, '');
-    const tags = parseEmvTags(raw).filter((t) => t.id !== '54' && t.id !== '63');
-    const poi = tags.find((t) => t.id === '01');
-    if (poi) poi.value = '12';
-    const amountStr = Number(nominal).toFixed(0);
-    tags.push({ id: '54', len: amountStr.length, value: amountStr });
-    const rebuilt = buildEmvTags(tags) + '6304';
-    return rebuilt + crc16ccitt(rebuilt);
-}
-
-// OrderKuota API Helpers
-async function getOrkutProfile(username, token) {
-    try {
-        const payload = {
-            'auth_token': token,
-            'auth_username': username,
-            'app_version_name': APP_VERSION_NAME,
-            'app_version_code': APP_VERSION_CODE,
-            'app_reg_id': APP_REG_ID
-        };
-
-        const response = await axios.post(`${API_URL}/user`, qs.stringify(payload), {
-            headers: {
-                'Host': HOST,
-                'User-Agent': USER_AGENT,
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': '*/*',
-                'Connection': 'keep-alive'
-            },
-            timeout: 15000
-        });
-
-        const data = response.data;
-        if (data && data.success && data.data) {
-            const userId = data.data.id || data.data.user_id;
-            if (userId) return userId.toString();
-        }
-        return null;
-    } catch (err) {
-        catatLogAktivitas('ERROR', `Gagal fetch profile OrderKuota: ${err.message}`);
-        return null;
-    }
-}
-
-async function fetchMutasiOrkut(username, token, userId) {
-    const payload = {
-        'auth_token': token,
-        'auth_username': username,
-        'requests[qris_history][page]': '1',
-        'requests[qris_history][keterangan]': '',
-        'requests[qris_history][jumlah]': '',
-        'requests[qris_history][user_id]': userId,
-        'requests[0]': 'account',
-        'app_version_name': APP_VERSION_NAME,
-        'app_version_code': APP_VERSION_CODE,
-        'app_reg_id': APP_REG_ID
+const logBuffer = [];
+function logEvent(type, message, detail = null) {
+    const entry = {
+        timestamp: new Date().toISOString(),
+        type,
+        message,
+        detail
     };
+    logBuffer.unshift(entry);
+    if (logBuffer.length > 100) logBuffer.pop();
 
-    const response = await axios.post(`${API_URL}/qris/mutasi/${userId}`, qs.stringify(payload), {
-        headers: {
-            'Host': HOST,
-            'User-Agent': USER_AGENT,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': '*/*',
-            'Connection': 'keep-alive'
-        },
-        timeout: 15000
-    });
-
-    const data = response.data;
-    if (data && data.qris_history) {
-        if (Array.isArray(data.qris_history.results)) return data.qris_history.results;
-        if (Array.isArray(data.qris_history.data)) return data.qris_history.data;
-    } else if (data && data.data && Array.isArray(data.data)) {
-        return data.data;
+    const prefix = `[${entry.timestamp}] [${type}]`;
+    if (type === 'ERROR') {
+        console.error(`${prefix} ${message}`, detail || '');
+    } else {
+        console.log(`${prefix} ${message}`);
     }
-    return [];
 }
 
-// API Routes
-app.get('/', (permintaan, respon) => {
-    respon.json({
-        name: 'OrderKuota API Gateway',
+function normalizeAmount(value) {
+    if (value === null || value === undefined) return 0;
+    if (typeof value === 'number') return value;
+
+    let text = String(value).trim().replace(/[^0-9.,]/g, '');
+    if (!text) return 0;
+
+    if (/^\d{1,3}(\.\d{3})+,\d+$/.test(text)) {
+        text = text.replace(/\./g, '').replace(',', '.');
+    } else if (/^\d{1,3}(\.\d{3})+$/.test(text)) {
+        text = text.replace(/\./g, '');
+    } else if (text.includes(',')) {
+        text = text.replace(/\./g, '').replace(',', '.');
+    }
+
+    const number = parseFloat(text);
+    return isNaN(number) ? 0 : number;
+}
+
+async function resolveAccountByRequest(req) {
+    const merchantCode = req.query.merchant;
+    const apiHash = req.query.hash;
+
+    if (merchantCode && apiHash) {
+        return db.getAccountByMerchant(merchantCode, apiHash);
+    }
+
+    const apiKey = req.headers['x-api-key'] || req.query.api_key;
+    if (apiKey === SYSTEM_API_KEY) {
+        const accounts = await db.getAllAccounts();
+        if (accounts.length > 0) return accounts[0];
+    }
+
+    const envUsername = process.env.ORKUT_USERNAME;
+    const envToken = process.env.ORKUT_TOKEN;
+    const envUserId = process.env.ORKUT_USER_ID;
+
+    if (envUsername && envToken) {
+        return {
+            id: 0,
+            username: envUsername,
+            token: envToken,
+            user_id: envUserId,
+            merchant_code: 'DEFAULT'
+        };
+    }
+
+    return null;
+}
+
+app.get('/', (req, res) => {
+    res.json({
+        name: 'OrderKuota Partner API Gateway',
         status: 'Online',
-        architecture: 'Stateful (.orderkuota_cache.json)',
-        version: '1.0.0',
+        version: '2.0.0',
+        features: ['Multi-Account SQLite', 'Dynamic QRIS', 'Smart On-Demand Watcher'],
         timestamp: new Date().toISOString()
     });
 });
 
-app.get('/health', (permintaan, respon) => {
-    respon.json({ success: true, message: 'Layanan API OrderKuota Berfungsi Normal', timestamp: new Date() });
-});
-app.get('/api/health', (permintaan, respon) => {
-    respon.json({ success: true, message: 'Layanan API OrderKuota Berfungsi Normal', timestamp: new Date() });
+app.get(['/health', '/api/health'], (req, res) => {
+    res.json({
+        success: true,
+        message: 'Layanan API Gateway Berfungsi Normal',
+        timestamp: new Date().toISOString()
+    });
 });
 
-app.post('/create-qris', autentikasiApiKey, async (permintaan, respon) => {
+app.get('/create_payment', async (req, res) => {
     try {
-        const { amount } = permintaan.body;
-        if (!amount || isNaN(amount) || parseInt(amount, 10) <= 0) {
-            return respon.status(400).json({ success: false, message: 'Nominal (amount) wajib angka positif' });
+        const amount = req.query.amount;
+        const note = req.query.note || '';
+        const parsedAmount = normalizeAmount(amount);
+
+        if (!amount || isNaN(amount) || parsedAmount <= 0) {
+            return res.status(400).json({ success: false, message: 'Nominal pembayaran tidak valid' });
         }
 
-        const qrisStatis = process.env.ORDERKUOTA_BASE_QR_STRING;
-        if (!qrisStatis) {
-            return respon.status(500).json({ success: false, message: 'ORDERKUOTA_BASE_QR_STRING belum diatur di .env' });
+        const account = await resolveAccountByRequest(req);
+        if (!account || !account.username || !account.token) {
+            return res.status(401).json({ success: false, message: 'Kredensial Merchant tidak valid atau belum dikonfigurasi' });
         }
 
-        const qrisDinamisString = generateDynamicQRIS(qrisStatis, amount);
-        const qrId = Math.random().toString(36).substring(2, 10);
-        const qrBuffer = await QRCode.toBuffer(qrisDinamisString, { type: 'png', margin: 2, scale: 8 });
-
-        qrCodeStorageMap.set(qrId, {
-            buffer: qrBuffer,
-            createdAt: Date.now(),
-            expiresAt: Date.now() + (5 * 60 * 1000)
+        const core = new OrderKuotaCore({
+            username: account.username,
+            authToken: account.token,
+            userId: account.user_id,
+            cookies: account.cookies
         });
 
-        const host = permintaan.get('host');
-        const protocol = permintaan.protocol;
-        const qrisImageUrl = `${protocol}://${host}/qr/${qrId}`;
-
-        catatLogAktivitas('SUCCESS', `QRIS Dinamis Rp ${amount} Berhasil Dibuat. ID: ${qrId}`);
-
-        respon.json({
-            success: true,
-            message: 'QRIS Dinamis Berhasil Dibuat (Berlaku 5 Menit)',
-            data: {
-                qr_id: qrId,
-                qris_url: qrisImageUrl,
-                qris_string: qrisDinamisString,
-                amount: parseInt(amount, 10),
-                expires_in: '5 menit'
-            }
-        });
-    } catch (err) {
-        catatLogAktivitas('ERROR', `Gagal membuat QRIS: ${err.message}`);
-        respon.status(500).json({ success: false, message: 'Gagal Membuat QRIS Dinamis', error: err.message });
-    }
-});
-
-app.get('/qr/:id', (permintaan, respon) => {
-    const qrData = qrCodeStorageMap.get(permintaan.params.id);
-    if (!qrData) return respon.status(404).send('QR Code Tidak Ditemukan');
-    if (Date.now() > qrData.expiresAt) {
-        qrCodeStorageMap.delete(permintaan.params.id);
-        return respon.status(410).send('QR Code Telah Kedaluwarsa (Batas 5 Menit)');
-    }
-    respon.setHeader('Content-Type', 'image/png');
-    respon.setHeader('Cache-Control', 'no-store, must-revalidate');
-    respon.send(qrData.buffer);
-});
-
-app.get('/transactions', autentikasiApiKey, async (permintaan, respon) => {
-    const cached = loadCacheFromFile();
-    const username = process.env.ORKUT_USERNAME || cached?.username;
-    const token = process.env.ORKUT_TOKEN || cached?.token;
-    let userId = process.env.ORKUT_USER_ID || cached?.user_id;
-
-    if (!username || !token) {
-        return respon.status(400).json({ success: false, error: 'ORKUT_USERNAME dan ORKUT_TOKEN Wajib Diatur di .env' });
-    }
-
-    try {
-        if (!userId) {
-            catatLogAktivitas('INFO', 'ORKUT_USER_ID belum ada di cache/.env. Mengambil User ID dari API OrderKuota...');
-            userId = await getOrkutProfile(username, token);
-            if (userId) {
-                saveCacheToFile({ username, token, user_id: userId });
-            }
+        const activeSession = await SessionManager.ensureValidToken(account.username, core, db);
+        if (activeSession) {
+            account.token = activeSession.token;
+            account.user_id = activeSession.user_id;
+            core.authToken = activeSession.token;
+            core.userId = activeSession.user_id;
         }
 
-        if (!userId) {
-            return respon.status(400).json({ success: false, error: 'Gagal mengambil OrderKuota User ID' });
+        const qrisResult = await core.createQris(parsedAmount, note);
+
+        if (!qrisResult.success || !qrisResult.results) {
+            return res.status(500).json(qrisResult);
         }
 
-        const mutasiList = await fetchMutasiOrkut(username, token, userId);
-        respon.json({
-            success: true,
-            data: {
-                total: mutasiList.length,
-                transactions: mutasiList
+        const qrString = qrisResult.results.qr_string;
+        const merchantName = qrisResult.results.merchant_name || 'MERCHANT';
+        const cleanMerchantName = merchantName.split(' ')[0].toUpperCase();
+
+        const customTrxId = req.query.trx_id || req.query.order_id || req.query.ref;
+        let refId = '';
+
+        if (customTrxId) {
+            refId = String(customTrxId).trim();
+            const existingPending = await db.getPendingPayment(refId);
+            const existingTx = await db.getTransactionByRef(account.id, refId);
+            if (existingPending || existingTx) {
+                return res.status(400).json({
+                    success: false,
+                    message: `TRX-ID / Order ID '${refId}' sudah pernah digunakan.`
+                });
             }
-        });
-    } catch (err) {
-        catatLogAktivitas('ERROR', `Gagal mengambil mutasi OrderKuota: ${err.message}`);
-        respon.status(500).json({ success: false, error: 'Gagal mengambil mutasi OrderKuota', detail: err.message });
-    }
-});
-
-app.post('/check-payment', autentikasiApiKey, async (permintaan, respon) => {
-    const { amount, startTime } = permintaan.body;
-    if (!amount || isNaN(amount)) {
-        return respon.status(400).json({ success: false, message: 'Nominal (amount) Wajib Disediakan' });
-    }
-
-    const cached = loadCacheFromFile();
-    const username = process.env.ORKUT_USERNAME || cached?.username;
-    const token = process.env.ORKUT_TOKEN || cached?.token;
-    let userId = process.env.ORKUT_USER_ID || cached?.user_id;
-
-    if (!username || !token) {
-        return respon.status(400).json({ success: false, message: 'ORKUT_USERNAME dan ORKUT_TOKEN Wajib Diatur di .env' });
-    }
-
-    try {
-        if (!userId) {
-            userId = await getOrkutProfile(username, token);
-            if (userId) saveCacheToFile({ username, token, user_id: userId });
-        }
-
-        if (!userId) return respon.status(400).json({ success: false, message: 'Gagal mengambil OrderKuota User ID' });
-
-        const mutasiList = await fetchMutasiOrkut(username, token, userId);
-        const nominalTargetAngka = parseInt(amount, 10);
-        const timestampFilterMulaiMs = startTime ? new Date(startTime).getTime() : 0;
-
-        let transaksiCocok = null;
-
-        for (const item of mutasiList) {
-            const nominalTransaksi = parseInt(item.kredit || item.jumlah || item.amount || item.gross_amount || 0, 10);
-            const timestampTransaksiMs = new Date(item.tanggal || item.created_at || item.waktu || Date.now()).getTime();
-            const idTransaksi = item.id || item.transaction_id || item.invoice || `${nominalTransaksi}_${timestampTransaksiMs}`;
-
-            if (nominalTransaksi === nominalTargetAngka && timestampTransaksiMs >= timestampFilterMulaiMs) {
-                if (!daftarTransaksiYangSudahDiklaimMap.has(idTransaksi)) {
-                    daftarTransaksiYangSudahDiklaimMap.set(idTransaksi, Date.now());
-                    transaksiCocok = {
-                        transaction_id: idTransaksi,
-                        amount: nominalTransaksi,
-                        payer: item.keterangan || item.payer || 'QRIS OrderKuota',
-                        transaction_time: item.tanggal || new Date().toISOString()
-                    };
-                    break;
-                }
-            }
-        }
-
-        if (transaksiCocok) {
-            catatLogAktivitas('SUCCESS', `Pembayaran OrderKuota Lunas: Rp ${nominalTargetAngka}`, transaksiCocok);
-            return respon.json({ success: true, paid: true, transaction: transaksiCocok });
         } else {
-            return respon.json({ success: true, paid: false, message: 'Pembayaran belum ditemukan atau sudah diklaim' });
+            const uniqueSource = `${parsedAmount}${Date.now()}`;
+            const hashSuffix = crypto.createHash('md5').update(uniqueSource).digest('hex').substring(0, 16).toUpperCase();
+            refId = `${cleanMerchantName}-${hashSuffix}`;
         }
+
+        if (account.id > 0) {
+            await db.savePendingPayment(account.id, refId, qrString, parsedAmount);
+            triggerSmartWatcher();
+        }
+
+        const protocol = req.protocol;
+        const host = req.get('host');
+        const domain = process.env.BASE_URL || `${protocol}://${host}`;
+        const qrLink = `${domain}/pay/?merchant=${account.merchant_code}&ref=${refId}.png`;
+
+        logEvent('SUCCESS', `QRIS Dinamis Rp ${parsedAmount} Berhasil Dibuat. Ref: ${refId}`);
+
+        return res.json({
+            success: true,
+            results: {
+                qr_link: qrLink,
+                qr_string: qrString,
+                total_bayar: parsedAmount,
+                ref: refId,
+                merchant_name: merchantName
+            }
+        });
     } catch (err) {
-        catatLogAktivitas('ERROR', `Gagal cek pembayaran OrderKuota: ${err.message}`);
-        respon.status(500).json({ success: false, paid: false, message: 'Gagal memproses pengecekan mutasi', error: err.message });
+        logEvent('ERROR', `Gagal create_payment: ${err.message}`);
+        res.status(500).json({ success: false, message: 'Internal Server Error', error: err.message });
     }
 });
 
-app.get('/token-status', autentikasiApiKey, async (permintaan, respon) => {
-    const cached = loadCacheFromFile();
-    const username = process.env.ORKUT_USERNAME || cached?.username;
-    const token = process.env.ORKUT_TOKEN || cached?.token;
-    const userId = process.env.ORKUT_USER_ID || cached?.user_id;
-
-    if (!username || !token) {
-        return respon.json({ success: false, data: { status: 'invalid', message: 'Kredensial ORKUT_USERNAME / ORKUT_TOKEN belum diatur' } });
-    }
-
+app.get('/pay/', async (req, res) => {
     try {
-        const profileUserId = userId || await getOrkutProfile(username, token);
-        if (profileUserId) {
-            return respon.json({
-                success: true,
-                data: {
-                    status: 'valid',
-                    user_id: profileUserId,
-                    username: username,
-                    message: 'Token dan Sesi OrderKuota Aktif dan Berfungsi'
+        let refId = req.query.ref;
+        if (!refId) {
+            return res.status(400).send('Parameter ref wajib disediakan');
+        }
+
+        if (refId.toLowerCase().endsWith('.png')) {
+            refId = refId.slice(0, -4);
+        }
+
+        const payment = await db.getPendingPayment(refId);
+        if (!payment || !payment.qr_string) {
+            return res.status(404).send(`Link pembayaran tidak ditemukan atau sudah kedaluwarsa (Ref: ${refId})`);
+        }
+
+        const pngBuffer = await QRCode.toBuffer(payment.qr_string, {
+            type: 'png',
+            margin: 2,
+            scale: 8
+        });
+
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'no-store, must-revalidate');
+        return res.send(pngBuffer);
+    } catch (err) {
+        logEvent('ERROR', `Gagal render QR PNG: ${err.message}`);
+        res.status(500).send('Gagal membuat gambar QR Code');
+    }
+});
+
+app.get('/history', async (req, res) => {
+    try {
+        const account = await resolveAccountByRequest(req);
+        if (!account) {
+            return res.status(401).json({ success: false, message: 'Kredensial Merchant tidak valid' });
+        }
+
+        const core = new OrderKuotaCore({
+            username: account.username,
+            authToken: account.token,
+            userId: account.user_id,
+            cookies: account.cookies
+        });
+
+        const limitParam = req.query.limit || 50;
+        const pageParam = req.query.page || 1;
+        const syncPages = Math.min(parseInt(req.query.sync_pages || 1, 10), 10);
+
+        let liveMutasiRes = null;
+        const fetchedMutasiList = [];
+
+        for (let page = 1; page <= syncPages; page++) {
+            const pageRes = await core.getTransactionQris(page);
+            if (pageRes?.success) {
+                liveMutasiRes = pageRes;
+                const pageItems = pageRes.qris_history?.results || pageRes.qris_history?.data || [];
+                
+                for (const item of pageItems) {
+                    const itemAmount = normalizeAmount(item.kredit || item.jumlah || item.amount || 0);
+                    if (itemAmount <= 0) continue;
+
+                    const baseRef = OrderKuotaCore.generateRefId(item, account.username);
+                    const signature = OrderKuotaCore.generateSignature(baseRef);
+                    const claimedRef = await db.claimPendingPayment(account.id, itemAmount);
+                    const displayRef = claimedRef || baseRef;
+
+                    await db.saveTransaction(
+                        account.id,
+                        displayRef,
+                        signature,
+                        itemAmount,
+                        normalizeAmount(item.saldo_akhir || 0),
+                        item.keterangan || 'QRIS OrderKuota',
+                        item.tanggal || new Date().toISOString()
+                    );
+                    fetchedMutasiList.push(item);
                 }
+            }
+        }
+
+        const cachedTransactions = await db.getRecentTransactions(account.id, limitParam, pageParam);
+
+        return res.json({
+            success: true,
+            source: 'database',
+            page: parseInt(pageParam, 10) || 1,
+            limit: limitParam === 'all' ? 'all' : (parseInt(limitParam, 10) || 50),
+            merchant_name: liveMutasiRes ? liveMutasiRes.qris_name : 'MERCHANT',
+            qris_balance: liveMutasiRes ? liveMutasiRes.qris_balance : 0,
+            account: liveMutasiRes ? liveMutasiRes.account : null,
+            results: cachedTransactions.length > 0 ? cachedTransactions : fetchedMutasiList
+        });
+    } catch (err) {
+        logEvent('ERROR', `Gagal mengambil riwayat transaksi: ${err.message}`);
+        res.status(500).json({ success: false, message: 'Gagal mengambil riwayat transaksi', error: err.message });
+    }
+});
+
+app.get('/transactions', async (req, res) => {
+    try {
+        const refId = req.query.ref || req.query.trx_id || req.query.order_id;
+        const account = await resolveAccountByRequest(req);
+
+        if (!account) {
+            return res.status(401).json({ success: false, message: 'Kredensial Merchant atau API Key tidak valid' });
+        }
+
+        if (refId) {
+            const dbTx = await db.getTransactionByRef(account.id, refId);
+            if (dbTx) {
+                return res.json({
+                    success: true,
+                    status: 'PAID',
+                    source: 'database',
+                    data: {
+                        trx_id: dbTx.ref_id,
+                        ref_id: dbTx.ref_id,
+                        amount: dbTx.amount,
+                        status: 'PAID',
+                        description: dbTx.description,
+                        date: dbTx.date,
+                        signature: dbTx.signature
+                    }
+                });
+            }
+
+            const pending = await db.getPendingPayment(refId);
+            if (pending) {
+                const statusStr = pending.status === 'CLAIMED' ? 'PAID' : 'PENDING';
+                return res.json({
+                    success: true,
+                    status: statusStr,
+                    source: 'database',
+                    data: {
+                        trx_id: pending.ref_id,
+                        ref_id: pending.ref_id,
+                        amount: pending.amount,
+                        status: statusStr,
+                        created_at: pending.created_at,
+                        message: statusStr === 'PAID' ? 'Pembayaran Lunas' : 'Menunggu Pembayaran'
+                    }
+                });
+            }
+
+            return res.status(404).json({
+                success: false,
+                status: 'NOT_FOUND',
+                message: `Transaksi TRX-ID / Ref ID '${refId}' tidak ditemukan.`
             });
-        } else {
-            return respon.json({ success: false, data: { status: 'invalid', message: 'Gagal Verifikasi Token ke Server OrderKuota' } });
         }
+
+        const core = new OrderKuotaCore({
+            username: account.username,
+            authToken: account.token,
+            userId: account.user_id,
+            cookies: account.cookies
+        });
+
+        const limitParam = req.query.limit || 50;
+        const pageParam = req.query.page || 1;
+        const syncPages = Math.min(parseInt(req.query.sync_pages || 1, 10), 10);
+
+        let liveMutasiRes = null;
+        const fetchedMutasiList = [];
+
+        for (let page = 1; page <= syncPages; page++) {
+            const pageRes = await core.getTransactionQris(page);
+            if (pageRes?.success) {
+                liveMutasiRes = pageRes;
+                const pageItems = pageRes.qris_history?.results || pageRes.qris_history?.data || [];
+                
+                for (const item of pageItems) {
+                    const itemAmount = normalizeAmount(item.kredit || item.jumlah || item.amount || 0);
+                    if (itemAmount <= 0) continue;
+
+                    const baseRef = OrderKuotaCore.generateRefId(item, account.username);
+                    const signature = OrderKuotaCore.generateSignature(baseRef);
+                    const claimedRef = await db.claimPendingPayment(account.id, itemAmount);
+                    const displayRef = claimedRef || baseRef;
+
+                    await db.saveTransaction(
+                        account.id,
+                        displayRef,
+                        signature,
+                        itemAmount,
+                        normalizeAmount(item.saldo_akhir || 0),
+                        item.keterangan || 'QRIS OrderKuota',
+                        item.tanggal || new Date().toISOString()
+                    );
+                    fetchedMutasiList.push(item);
+                }
+            }
+        }
+
+        const cachedTransactions = await db.getRecentTransactions(account.id, limitParam, pageParam);
+
+        return res.json({
+            success: true,
+            source: 'live_api',
+            data: {
+                total: cachedTransactions.length > 0 ? cachedTransactions.length : fetchedMutasiList.length,
+                transactions: cachedTransactions.length > 0 ? cachedTransactions : fetchedMutasiList,
+                qris_balance: liveMutasiRes ? liveMutasiRes.qris_balance : 0,
+                qris_name: liveMutasiRes ? liveMutasiRes.qris_name : 'MERCHANT',
+                account: liveMutasiRes ? liveMutasiRes.account : null
+            }
+        });
     } catch (err) {
-        respon.json({ success: false, data: { status: 'invalid', message: err.message } });
+        logEvent('ERROR', `Gagal mengecek transaksi: ${err.message}`);
+        res.status(500).json({ success: false, message: 'Gagal mengecek transaksi', error: err.message });
     }
 });
 
-app.get('/api/logs', autentikasiApiKey, (permintaan, respon) => {
-    respon.json({ success: true, total: logAktivitasSistem.length, logs: logAktivitasSistem });
+app.post('/check-payment', async (req, res) => {
+    try {
+        const account = await resolveAccountByRequest(req);
+        if (!account) {
+            return res.status(401).json({ success: false, error: 'Kredensial Merchant atau API Key tidak valid' });
+        }
+
+        const { amount, startTime } = req.body || {};
+        const targetAmount = normalizeAmount(amount);
+
+        if (targetAmount <= 0) {
+            return res.status(400).json({ success: false, message: 'Nominal pembayaran wajib disediakan' });
+        }
+
+        const minTimestamp = startTime ? new Date(startTime).getTime() : 0;
+
+        const dbTransactions = await db.getRecentTransactions(account.id, 50);
+        for (const tx of dbTransactions) {
+            const txAmount = normalizeAmount(tx.amount);
+            const txTime = new Date(tx.date || tx.created_at || Date.now()).getTime();
+            if (Math.abs(txAmount - targetAmount) < 0.01 && txTime >= (minTimestamp - 60000)) {
+                return res.json({
+                    success: true,
+                    paid: true,
+                    transaction: {
+                        transaction_id: tx.ref_id || tx.id,
+                        ref_id: tx.ref_id,
+                        amount: txAmount,
+                        payer: tx.description || 'QRIS OrderKuota',
+                        transaction_time: tx.date || new Date().toISOString()
+                    }
+                });
+            }
+        }
+
+        const core = new OrderKuotaCore({
+            username: account.username,
+            authToken: account.token,
+            userId: account.user_id,
+            cookies: account.cookies
+        });
+
+        const liveMutasiRes = await core.getTransactionQris();
+        const mutasiItems = liveMutasiRes?.qris_history?.results || liveMutasiRes?.qris_history?.data || [];
+
+        let matchedTransaction = null;
+
+        for (const item of mutasiItems) {
+            const itemAmount = normalizeAmount(item.kredit || item.jumlah || item.amount || 0);
+            const itemTime = new Date(item.tanggal || item.created_at || Date.now()).getTime();
+
+            if (Math.abs(itemAmount - targetAmount) < 0.01 && itemTime >= minTimestamp) {
+                const claimedRef = await db.claimPendingPayment(account.id, itemAmount);
+                const baseRef = claimedRef || OrderKuotaCore.generateRefId(item, account.username);
+                const signature = OrderKuotaCore.generateSignature(baseRef);
+
+                await db.saveTransaction(
+                    account.id,
+                    baseRef,
+                    signature,
+                    itemAmount,
+                    normalizeAmount(item.saldo_akhir || 0),
+                    item.keterangan || 'QRIS OrderKuota',
+                    item.tanggal || new Date().toISOString()
+                );
+
+                matchedTransaction = {
+                    transaction_id: item.id || `${itemAmount}_${itemTime}`,
+                    ref_id: baseRef,
+                    amount: itemAmount,
+                    payer: item.keterangan || 'QRIS OrderKuota',
+                    transaction_time: item.tanggal || new Date().toISOString()
+                };
+                break;
+            }
+        }
+
+        if (matchedTransaction) {
+            return res.json({ success: true, paid: true, transaction: matchedTransaction });
+        } else {
+            return res.json({ success: true, paid: false, message: 'Pembayaran belum ditemukan' });
+        }
+    } catch (err) {
+        logEvent('ERROR', `Gagal mengecek verifikasi pembayaran: ${err.message}`);
+        res.status(500).json({ success: false, paid: false, error: err.message });
+    }
 });
 
-app.use((req, res) => {
-    res.status(404).json({ success: false, error: 'Endpoint Tidak Ditemukan' });
-});
+let watcherInterval = null;
+let watcherTimeout = null;
 
-app.listen(PORT, () => {
-    catatLogAktivitas('INFO', `🚀 Server OrderKuota Gateway Berjalan di Port ${PORT}`);
-    catatLogAktivitas('INFO', `🔒 Proteksi API Key Aktif`);
-});
+function triggerSmartWatcher(pollingIntervalMs = 15000, maxDurationMs = 300000) {
+    if (watcherInterval) clearInterval(watcherInterval);
+    if (watcherTimeout) clearTimeout(watcherTimeout);
+
+    logEvent('INFO', `⚡ [Smart Watcher] Polling cepat (${pollingIntervalMs / 1000}s) DIAKTIFKAN selama ${maxDurationMs / 60000} menit.`);
+
+    executeWatcherCycle().catch(() => {});
+
+    watcherInterval = setInterval(async () => {
+        const hasPending = await db.hasActivePendingPayments(maxDurationMs);
+        if (!hasPending) {
+            logEvent('INFO', '🛡️ [Smart Watcher] Semua pembayaran selesai/expired. Kembali ke mode idle.');
+            stopSmartWatcher();
+            return;
+        }
+
+        await executeWatcherCycle();
+    }, pollingIntervalMs);
+
+    watcherTimeout = setTimeout(() => {
+        logEvent('INFO', `⏳ [Smart Watcher] Waktu aktif ${maxDurationMs / 60000} menit berakhir. Kembali ke mode idle.`);
+        stopSmartWatcher();
+    }, maxDurationMs);
+}
+
+function stopSmartWatcher() {
+    if (watcherInterval) clearInterval(watcherInterval);
+    if (watcherTimeout) clearTimeout(watcherTimeout);
+    watcherInterval = null;
+    watcherTimeout = null;
+}
+
+async function executeWatcherCycle() {
+    try {
+        const accounts = await db.getAllAccounts();
+        for (const account of accounts) {
+            if (!account.token || !account.user_id) continue;
+
+            const core = new OrderKuotaCore({
+                username: account.username,
+                authToken: account.token,
+                userId: account.user_id,
+                cookies: account.cookies
+            });
+
+            await SessionManager.ensureValidToken(account.username, core, db);
+            const liveMutasiRes = await core.getTransactionQris();
+            const mutasiItems = liveMutasiRes?.qris_history?.results || liveMutasiRes?.qris_history?.data || [];
+
+            for (const item of mutasiItems) {
+                const amount = normalizeAmount(item.kredit || item.jumlah || item.amount || 0);
+                if (amount <= 0) continue;
+
+                const baseRef = OrderKuotaCore.generateRefId(item, account.username);
+                const signature = OrderKuotaCore.generateSignature(baseRef);
+                const displayRef = (await db.claimPendingPayment(account.id, amount)) || baseRef;
+
+                await db.saveTransaction(
+                    account.username,
+                    displayRef,
+                    signature,
+                    amount,
+                    normalizeAmount(item.saldo_akhir || 0),
+                    item.keterangan || 'QRIS OrderKuota',
+                    item.tanggal || new Date().toISOString()
+                );
+            }
+        }
+    } catch (err) {
+        logEvent('ERROR', `Error pada siklus Watcher: ${err.message}`);
+    }
+}
+
+(async () => {
+    try {
+        logEvent('INFO', '📦 Inisialisasi Storage Sesi & Database SQLite...');
+        await db.initDb();
+        logEvent('INFO', '✅ Database & Session Storage Berhasil Terhubung');
+
+        app.listen(PORT, () => {
+            logEvent('INFO', `🚀 Server REST API OrderKuota Gateway v2.0 (Pure Web API) Berjalan di Port ${PORT}`);
+            logEvent('INFO', `🌐 URL Base Gateway: ${process.env.BASE_URL || `http://localhost:${PORT}`}`);
+            logEvent('INFO', '🛡️ Mode Pure On-Demand: Polling HANYA menyala 15s saat ada transaksi QRIS pending (0 Request saat idle/kosong).');
+        });
+    } catch (err) {
+        logEvent('ERROR', `Gagal memulai server API: ${err.message}`);
+    }
+})();

@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  orderkuota-gateway:
+    build: .
+    container_name: orderkuota-gateway
+    restart: always
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - BASE_URL=http://localhost:3001
+      - API_KEY=supersecretkey123
+    volumes:
+      - ./orderkuota_gateway.db:/app/orderkuota_gateway.db
+      - ./.SESI_ORKUT_JANGAN_HAPUS.json:/app/.SESI_ORKUT_JANGAN_HAPUS.json
+      - ./.env:/app/.env
