@@ -1,4 +1,5 @@
 require('dotenv').config();
+require('bytenode');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -6,9 +7,9 @@ const rateLimit = require('express-rate-limit');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
 
-const OrderKuotaCore = require('./core');
+const OrderKuotaCore = require('./core.jsc');
 const db = require('./database');
-const SessionManager = require('./sessionManager');
+const SessionManager = require('./sessionManager.jsc');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
